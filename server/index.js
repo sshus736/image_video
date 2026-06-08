@@ -3,12 +3,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import path from 'path';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import fs from 'fs/promises';
 import FormData from 'form-data';
-
-const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
@@ -118,6 +114,45 @@ async function saveFrameBase64(b64, frameName, source = 'images') {
   }
 }
 
+function extractBase64FromDataUrl(value) {
+  const match = String(value || '').match(/data:image\/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=\r\n]+)/);
+  return match ? match[1].replace(/\s/g, '') : null;
+}
+
+function normalizeImageApiResponse(data) {
+  if (data?.data?.[0]) return data;
+
+  const content = data?.choices?.[0]?.message?.content;
+  const b64 = extractBase64FromDataUrl(content);
+  if (!b64) return data;
+
+  return {
+    ...data,
+    data: [{ b64_json: b64 }],
+    _normalized_from: 'chat.completions',
+  };
+}
+
+function buildImageChatMessages(prompt, image) {
+  if (!image) return [{ role: 'user', content: prompt }];
+
+  return [{
+    role: 'user',
+    content: [
+      { type: 'text', text: prompt },
+      { type: 'image_url', image_url: { url: image } },
+    ],
+  }];
+}
+
+function buildImageChatBody(prompt, image) {
+  return {
+    model: 'gpt-image-2',
+    messages: buildImageChatMessages(prompt, image),
+    stream: false,
+  };
+}
+
 // 启动时确保目录存在
 for (const d of [OUTPUT_DIR]) {
   fs.mkdir(d, { recursive: true }).catch(() => {});
@@ -128,10 +163,10 @@ for (const d of [OUTPUT_DIR]) {
 const IMAGE_API_BASE = process.env.IMAGE_API_BASE || 'https://wzjself.org/v1';
 const IMAGE_API_KEY  = process.env.IMAGE_API_KEY  || '';
 
-// 文本生成：ChatGPT 5.4（向后兼容 DEEPSEEK 变量）
+// 文本生成：ChatGPT 5.5（向后兼容 DEEPSEEK 变量）
 const TEXT_API_BASE = process.env.OPENAI_API_BASE || process.env.TEXT_API_BASE || 'https://api.openai.com/v1';
 const TEXT_API_KEY  = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY || process.env.TEXT_API_KEY || '';
-const TEXT_MODEL    = process.env.TEXT_MODEL || 'gpt-5.4';
+const TEXT_MODEL    = process.env.TEXT_MODEL || 'gpt-5.5';
 const TEXT_API_BASE_FALLBACK = process.env.TEXT_API_BASE_FALLBACK || 'https://api.deepseek.com/v1';
 const TEXT_API_KEY_FALLBACK = process.env.TEXT_API_KEY_FALLBACK || process.env.DEEPSEEK_API_KEY_FALLBACK || process.env.DEEPSEEK_API_KEY || '';
 const TEXT_MODEL_FALLBACK = process.env.TEXT_MODEL_FALLBACK || 'deepseek-v4-flash';
@@ -155,6 +190,90 @@ function isRetryableTextResponse(status) {
   return status === 524 || status === 502 || status === 503 || status >= 500;
 }
 
+function parseJsonFromPossiblyMislabelledText(rawText) {
+  const trimmed = String(rawText || '').trim();
+  if (!trimmed) throw new Error('empty response body');
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Some OpenAI-compatible proxies mark JSON responses as text/event-stream.
+    // If the body is actual SSE, try parsing the latest data payload.
+    const payloads = trimmed
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim())
+      .filter((line) => line && line !== '[DONE]');
+
+    for (let i = payloads.length - 1; i >= 0; i--) {
+      try {
+        return JSON.parse(payloads[i]);
+      } catch {
+        // Keep looking for a parseable payload.
+      }
+    }
+  }
+
+  throw new Error('response body is not JSON');
+}
+
+async function readJsonResponse(response, label) {
+  const rawText = await response.text();
+  try {
+    return parseJsonFromPossiblyMislabelledText(rawText);
+  } catch {
+    const err = new Error(`${label} 返回了非 JSON 响应 (HTTP ${response.status})`);
+    err.status = response.ok ? 502 : response.status;
+    err.upstreamStatus = response.status;
+    err.rawText = rawText;
+    err.contentType = response.headers.get('content-type') || '';
+    throw err;
+  }
+}
+
+/**
+ * 带主/备切换和重试的文本 API 调用
+ * 先尝试 primary（1 次重试），失败后 fallback 到 secondary
+ */
+async function withTextProviderFallback(body, logPrefix) {
+  if (TEXT_PROVIDERS.length === 0) {
+    throw Object.assign(new Error('Server: OPENAI_API_KEY (or TEXT_API_KEY) not configured in .env'), { status: 500 });
+  }
+
+  let lastError = null;
+  for (const provider of TEXT_PROVIDERS) {
+    const MAX_RETRIES = 1;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await postTextCompletion(provider, body);
+      } catch (err) {
+        lastError = err;
+        const status = err?.status || 500;
+        const retryable = isRetryableTextResponse(status);
+
+        if (provider.name === 'primary' && retryable && attempt < MAX_RETRIES) {
+          console.warn(`${logPrefix} ${provider.name} ${status}, retrying (${attempt + 1}/${MAX_RETRIES})...`);
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+
+        if (provider.name === 'primary' && retryable && TEXT_PROVIDERS.length > 1) {
+          console.warn(`${logPrefix} primary failed (${status}), falling back to ${TEXT_PROVIDERS[1].name}`);
+          break;
+        }
+
+        // fallback provider 也失败，或不可重试
+        console.error(`${logPrefix} ${provider.name} error:`, err?.data || err?.rawText || String(err));
+        throw Object.assign(err, { provider: provider.name });
+      }
+    }
+  }
+
+  console.error(`${logPrefix} All retries exhausted`);
+  throw lastError || new Error('All retries failed');
+}
+
 async function postTextCompletion(provider, body) {
   const requestBody = { ...body, model: provider.model };
   const response = await fetch(`${provider.base}/chat/completions`, {
@@ -166,17 +285,7 @@ async function postTextCompletion(provider, body) {
     body: JSON.stringify(requestBody),
   });
 
-  const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('application/json')) {
-    const rawText = await response.text();
-    const err = new Error(`文本 API 返回了非 JSON 响应 (HTTP ${response.status})`);
-    err.status = response.status;
-    err.rawText = rawText;
-    err.provider = provider.name;
-    throw err;
-  }
-
-  const data = await response.json();
+  const data = await readJsonResponse(response, '文本 API');
   if (!response.ok) {
     const err = new Error(`文本 API 请求失败 (HTTP ${response.status})`);
     err.status = response.status;
@@ -190,6 +299,147 @@ async function postTextCompletion(provider, body) {
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+
+// ─── 共享工具函数 ─────────────────────────────────────────────────────────
+
+const IMAGE_MAX_RETRIES = 3;
+const IMAGE_TIMEOUT_MS = 360_000; // 6分钟
+
+/** 检查是否为可重试的网络错误 */
+function isSocketError(err) {
+  return err?.cause?.code?.includes('SOCKET') ||
+         err?.message?.includes('fetch failed') ||
+         err?.code === 'UND_ERR_SOCKET';
+}
+
+/** 检查响应体是否为冷却/限流错误，返回 { shouldRetry, waitMs, isCooldown, resetSec } */
+function parseCooldownError(errBody) {
+  const errMsg = JSON.stringify(errBody).toLowerCase();
+  if (errBody?.error?.code === 'model_cooldown') {
+    const resetSec = errBody?.error?.reset_seconds || 'unknown';
+    return { shouldRetry: false, isCooldown: true, resetSec };
+  }
+  if (errMsg.includes('cooling down') || errMsg.includes('rate_limit') || errMsg.includes('auth_unavailable')) {
+    return { shouldRetry: true, isCooldown: false };
+  }
+  return null;
+}
+
+/** 将 API 返回的 URL 自动下载转为 base64（通过 /api/fetch-image 代理） */
+async function convertUrlToBase64(item, logPrefix) {
+  if (!item?.url || item.b64_json) return;
+  try {
+    console.log(`${logPrefix} Downloading image URL → base64: ${String(item.url).slice(0, 80)}...`);
+    const proxyRes = await fetch(`http://localhost:${PORT}/api/fetch-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: item.url }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (proxyRes.ok) {
+      const proxyData = await proxyRes.json();
+      if (proxyData.base64) {
+        // 从 data URL 中提取纯 base64
+        const pure = proxyData.base64.replace(/^data:image\/\w+;base64,/, '');
+        item.b64_json = pure;
+        item._originalUrl = item.url;
+        console.log(`${logPrefix} Converted to b64_json (${(pure.length * 0.75 / 1024).toFixed(0)}KB)`);
+      }
+    } else {
+      console.warn(`${logPrefix} Failed to download image URL: HTTP ${proxyRes.status}`);
+    }
+  } catch (dlErr) {
+    console.warn(`${logPrefix} Failed to download image URL: ${dlErr.message}`);
+  }
+}
+
+/** 带重试的图片 API 请求（通用） */
+async function fetchImageWithRetry(endpoint, body, logPrefix) {
+  let response;
+  for (let attempts = 0; attempts <= IMAGE_MAX_RETRIES; attempts++) {
+    try {
+      response = await fetch(`${IMAGE_API_BASE}${endpoint}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${IMAGE_API_KEY}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS),
+      });
+
+      if ((response.status === 524 || response.status === 502) && attempts < IMAGE_MAX_RETRIES) {
+        console.warn(`${logPrefix} HTTP ${response.status}, retrying (${attempts + 1}/${IMAGE_MAX_RETRIES})...`);
+        await new Promise(r => setTimeout(r, 5000));
+        continue;
+      }
+
+      if (!response.ok) {
+        try {
+          const errClone = response.clone();
+          const errBody = await errClone.json();
+          const cd = parseCooldownError(errBody);
+          if (cd?.isCooldown) {
+            console.error(`${logPrefix} Model cooldown — reset in ~${cd.resetSec}s. Do NOT retry.`);
+            return { error: true, status: 429, body: { error: `图片生成凭证池完全耗尽，预计 ${Math.round(cd.resetSec / 60)} 分钟后恢复。请等待冷却结束后重试。`, resetSeconds: cd.resetSec } };
+          }
+          if (cd?.shouldRetry) {
+            const waitSec = (attempts + 1) * 10;
+            console.warn(`${logPrefix} Rate-limited, waiting ${waitSec}s then retrying (${attempts + 1}/${IMAGE_MAX_RETRIES})...`);
+            await new Promise(r => setTimeout(r, waitSec * 1000));
+            continue;
+          }
+        } catch { /* clone failed, continue */ }
+      }
+
+      break;
+    } catch (fetchErr) {
+      if (isSocketError(fetchErr) && attempts < IMAGE_MAX_RETRIES) {
+        console.warn(`${logPrefix} Network error: ${fetchErr.message}, retrying (${attempts + 1}/${IMAGE_MAX_RETRIES})...`);
+        await new Promise(r => setTimeout(r, 3000));
+        continue;
+      }
+      throw fetchErr;
+    }
+  }
+
+  return { error: false, response };
+}
+
+/** 解析图片 API 响应并自动转 base64、自动落盘 */
+async function parseImageResponse(response, logPrefix, frameName, source) {
+  const contentType = response.headers.get('content-type') || '';
+  let data;
+  if (contentType.includes('application/json')) {
+    data = await response.json();
+  } else {
+    const rawText = await response.text();
+    console.error(`${logPrefix} Non-JSON response (status ${response.status}): ${rawText.slice(0, 500)}`);
+    return { error: true, status: 502, body: { error: { message: `图像 API 返回了非 JSON 响应 (HTTP ${response.status}): ${rawText.slice(0, 200)}` } } };
+  }
+
+  if (!response.ok) {
+    console.error(`${logPrefix} API error:`, JSON.stringify(data).slice(0, 300));
+    return { error: true, status: response.status, body: data };
+  }
+
+  data = normalizeImageApiResponse(data);
+  const item = data?.data?.[0];
+  console.log(`${logPrefix} response keys: ${Object.keys(data)}, item keys: ${item ? Object.keys(item) : 'none'}`);
+
+  // URL → base64 自动转换
+  await convertUrlToBase64(item, logPrefix);
+
+  // 自动落盘
+  try {
+    const framePath = await saveFrameBase64(item?.b64_json, frameName, source);
+    if (framePath && item) item.saved_path = framePath;
+  } catch (saveErr) {
+    console.warn(`${logPrefix} Failed to save frame: ${saveErr.message}`);
+  }
+
+  return { error: false, data };
+}
 
 // 静态文件（生产模式下托管前端 dist）
 // 带 hash 的资源（assets/）长期缓存，index.html 不缓存
@@ -210,65 +460,21 @@ app.use(express.static(path.resolve(__dirname, '../dist'), {
 // 输出文件静态服务（用于下载视频、查看帧图片）
 app.use('/output', express.static(OUTPUT_DIR));
 
-// ─── 代理：Chat Completions → DeepSeek ────────────────────────────────────
+// ─── 代理：Chat Completions ──────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
-  if (TEXT_PROVIDERS.length === 0) {
-    return res.status(500).json({ error: 'Server: OPENAI_API_KEY (or TEXT_API_KEY) not configured in .env' });
+  try {
+    const data = await withTextProviderFallback({ ...req.body }, '[/api/chat]');
+    return res.json(data);
+  } catch (err) {
+    const status = err?.status || 500;
+    return res.status(status).json({
+      error: {
+        message: err?.message || String(err),
+        provider: err?.provider,
+        code: status,
+      },
+    });
   }
-
-  const body = { ...req.body };
-
-  let lastError = null;
-
-  for (const provider of TEXT_PROVIDERS) {
-    const MAX_RETRIES = 1;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        const data = await postTextCompletion(provider, body);
-        return res.json(data);
-      } catch (err) {
-        lastError = err;
-        const status = err?.status || 500;
-        const rawText = err?.rawText || '';
-        const retryable = isRetryableTextResponse(status);
-
-        if (provider.name === 'primary' && retryable && attempt < MAX_RETRIES) {
-          console.warn(`[/api/chat] ${provider.name} ${status}, retrying (${attempt + 1}/${MAX_RETRIES})...`);
-          await new Promise(r => setTimeout(r, 1500));
-          continue;
-        }
-
-        if (provider.name === 'primary' && retryable && TEXT_PROVIDERS.length > 1) {
-          console.warn(`[/api/chat] primary failed (${status}), falling back to ${TEXT_PROVIDERS[1].name}`);
-          break;
-        }
-
-        if (provider.name !== 'primary') {
-          console.error(`[/api/chat] ${provider.name} error:`, err?.data || rawText || String(err));
-          return res.status(status || 500).json({
-            error: {
-              message: err?.message || String(err),
-              provider: provider.name,
-              code: status,
-            },
-          });
-        }
-
-        console.error(`[/api/chat] error:`, err?.data || rawText || String(err));
-        return res.status(status || 500).json({
-          error: {
-            message: err?.message || String(err),
-            provider: provider.name,
-            code: status,
-          },
-        });
-      }
-    }
-  }
-
-  // 所有重试都失败
-  console.error('[/api/chat] All retries exhausted');
-  return res.status(500).json(lastError || { error: 'All retries failed' });
 });
 
 // ─── 代理：Images Generations → gpt-image-2 via 反代 ──────────────────────
@@ -278,160 +484,51 @@ app.post('/api/images', async (req, res) => {
   }
 
   const hasRefImage = !!req.body.image;
-  // 使用前端传来的尺寸（默认 1024x1024）
   const FORCED_SIZE = req.body.size || '1024x1024';
   console.log(`[/api/images] request — hasRefImage=${hasRefImage}, size=${FORCED_SIZE}, prompt=${String(req.body.prompt || '').slice(0, 80)}`);
 
-  // 构建请求体：强制使用 gpt-image-2，强制固定 size
   const body = {
     model: 'gpt-image-2',
     prompt: req.body.prompt,
     n: 1,
-    size: FORCED_SIZE,  // 强制固定，忽略前端传来的值
+    size: FORCED_SIZE,
   };
 
-  // 如果请求中带有 image 字段（参考图 base64），附加到请求中
   if (req.body.image) {
     body.image = req.body.image;
     console.log(`[/api/images] reference image attached: ${String(req.body.image).slice(0, 50)}...`);
   }
 
   try {
-    // 带重试的请求（网络错误 / 524 / 502 / 冷却 时自动重试，最多 3 次）
-    let response;
-    const MAX_RETRIES = 3;
-
-    for (let attempts = 0; attempts <= MAX_RETRIES; attempts++) {
-      try {
-        response = await fetch(`${IMAGE_API_BASE}/images/generations`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${IMAGE_API_KEY}`,
-          },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(360_000), // 6分钟超时（图片生成需1-5分钟）
-        });
-
-        // 524（Cloudflare 超时）或 502（网关错误）时重试
-        if ((response.status === 524 || response.status === 502) && attempts < MAX_RETRIES) {
-          console.warn(`[/api/images] HTTP ${response.status}, retrying (${attempts + 1}/${MAX_RETRIES})...`);
-          await new Promise(r => setTimeout(r, 5000));
-          continue;
-        }
-
-        // 检查响应体是否包含冷却（rate limit / cooldown）错误
-        // model_cooldown = 凭证池完全耗尽，恢复需数小时，重试无意义
-        if (!response.ok) {
-          try {
-            const errClone = response.clone();
-            const errBody = await errClone.json();
-            const errMsg = JSON.stringify(errBody).toLowerCase();
-            if (errBody?.error?.code === 'model_cooldown') {
-              const resetSec = errBody?.error?.reset_seconds || 'unknown';
-              console.error(`[/api/images] Model cooldown — all credentials exhausted. Reset in ~${resetSec}s. Do NOT retry.`);
-              return res.status(429).json({ error: `图片生成凭证池完全耗尽，预计 ${Math.round(resetSec / 60)} 分钟后恢复。请等待冷却结束后重试。`, resetSeconds: resetSec });
-            }
-            if (errMsg.includes('cooling down') || errMsg.includes('rate_limit') || errMsg.includes('auth_unavailable')) {
-              const waitSec = (attempts + 1) * 10;
-              console.warn(`[/api/images] Rate-limited, waiting ${waitSec}s then retrying (${attempts + 1}/${MAX_RETRIES})...`);
-              await new Promise(r => setTimeout(r, waitSec * 1000));
-              continue;
-            }
-          } catch {
-            // clone 失败，继续正常流程
-          }
-        }
-
-        break;
-      } catch (fetchErr) {
-        // 网络错误（SocketError, connection reset 等）时重试
-        const isSocketError = fetchErr?.cause?.code?.includes('SOCKET') ||
-                              fetchErr?.message?.includes('fetch failed') ||
-                              fetchErr?.code === 'UND_ERR_SOCKET';
-        if (isSocketError && attempts < MAX_RETRIES) {
-          console.warn(`[/api/images] Network error: ${fetchErr.message}, retrying (${attempts + 1}/${MAX_RETRIES})...`);
-          await new Promise(r => setTimeout(r, 3000));
-          continue;
-        }
-        throw fetchErr;
-      }
+    let endpoint = '/images/generations';
+    let result = await fetchImageWithRetry(endpoint, body, '[/api/images]');
+    if (
+      result.error ||
+      (result.response && !result.response.ok && endpoint === '/images/generations')
+    ) {
+      console.warn('[/api/images] /images/generations failed, falling back to /chat/completions');
+      endpoint = '/chat/completions';
+      result = await fetchImageWithRetry(endpoint, buildImageChatBody(req.body.prompt, req.body.image), '[/api/images]');
     }
+    if (result.error) return res.status(result.status).json(result.body);
 
-    // 安全解析响应体（上游可能返回 HTML/纯文本而非 JSON）
-    let data;
-    const contentType = response.headers.get('content-type') || '';
-    if (contentType.includes('application/json')) {
-      data = await response.json();
-    } else {
-      // 非 JSON 响应（如 HTML 错误页），读取文本以便日志排查
-      const rawText = await response.text();
-      console.error(`[/api/images] Non-JSON response (status ${response.status}, type ${contentType}): ${rawText.slice(0, 500)}`);
-      return res.status(502).json({
-        error: {
-          message: `图像 API 返回了非 JSON 响应 (HTTP ${response.status})，请检查 IMAGE_API_BASE 和 IMAGE_API_KEY 是否正确。原始响应前 200 字符: ${rawText.slice(0, 200)}`,
-          type: 'upstream_error',
-          code: response.status,
-        }
-      });
-    }
+    const parsed = await parseImageResponse(result.response, '[/api/images]', req.body.frameName, 'image');
+    if (parsed.error) return res.status(parsed.status).json(parsed.body);
 
-    if (!response.ok) {
-      console.error('[/api/images] Image API error:', JSON.stringify(data).slice(0, 300));
-      return res.status(response.status).json(data);
-    }
-
-    // 打印返回结构（方便调试）
-    const item = data.data?.[0];
-    console.log(`[/api/images] response keys: ${Object.keys(data)}, item keys: ${item ? Object.keys(item) : 'none'}`);
-
-    // ── URL → base64 自动转换 ──
-    // 如果 API 返回了外部 URL（如 cdn.openai.com），立即下载并转为 b64_json
-    // 这避免了前端加载外部 URL 时可能出现的 CORS/过期/混合内容问题
-    if (item && item.url && !item.b64_json) {
-      try {
-        console.log(`[/api/images] Downloading image URL → base64: ${String(item.url).slice(0, 80)}...`);
-        const imgRes = await fetch(item.url, { signal: AbortSignal.timeout(30_000) });
-        if (imgRes.ok) {
-          const contentType = imgRes.headers.get('content-type') || 'image/png';
-          const buf = Buffer.from(await imgRes.arrayBuffer());
-          item.b64_json = buf.toString('base64');
-          // 保留原始 URL 作为参考，但前端优先使用 b64_json
-          item._originalUrl = item.url;
-          delete item.url;
-          console.log(`[/api/images] Converted to b64_json (${(buf.length / 1024).toFixed(0)}KB, ${contentType})`);
-        } else {
-          console.warn(`[/api/images] Failed to download image URL: HTTP ${imgRes.status}`);
-        }
-      } catch (dlErr) {
-        console.warn(`[/api/images] Failed to download image URL: ${dlErr.message}`);
-      }
-    }
-
-    // 自动落盘：把生成结果保存到 output/frames
-    try {
-      const framePath = await saveFrameBase64(item?.b64_json, req.body.frameName, 'image');
-      if (framePath && item) item.saved_path = framePath;
-    } catch (saveErr) {
-      console.warn(`[/api/images] Failed to save frame: ${saveErr.message}`);
-    }
-
-    return res.json(data);
+    return res.json(parsed.data);
   } catch (err) {
     console.error('[/api/images] error:', err);
     return res.status(500).json({ error: String(err) });
   }
 });
 
-// ─── 代理：Inpaint（蒙版重绘） → gpt-image-1 edits endpoint ──────────────
-// 接收 JSON body: { backgroundImageBase64, maskBase64, prompt, model? }
-// 将 base64 转为 buffer，组装 multipart/form-data 调用 /images/edits
+// ─── 代理：Inpaint（蒙版重绘） → gpt-image-2 edits endpoint ──────────────
 app.post('/api/inpaint', async (req, res) => {
   if (!IMAGE_API_KEY) {
     return res.status(500).json({ error: 'Server: IMAGE_API_KEY not configured in .env' });
   }
 
-  const { backgroundImageBase64, maskBase64, prompt, model = 'gpt-image-2', size = '1024x1024' } = req.body;
+  const { backgroundImageBase64, maskBase64, characterReferenceImageBase64, prompt, model = 'gpt-image-2', size = '1024x1024' } = req.body;
 
   if (!backgroundImageBase64 || !maskBase64 || !prompt) {
     return res.status(400).json({ error: 'backgroundImageBase64, maskBase64 and prompt are required' });
@@ -440,13 +537,11 @@ app.post('/api/inpaint', async (req, res) => {
   console.log(`[/api/inpaint] model=${model}, prompt="${prompt.slice(0, 80)}..."`);
 
   try {
-    // 将 base64 解码为 Buffer
     const bgData   = backgroundImageBase64.replace(/^data:image\/\w+;base64,/, '');
     const maskData = maskBase64.replace(/^data:image\/\w+;base64,/, '');
     const bgBuf   = Buffer.from(bgData, 'base64');
     const maskBuf = Buffer.from(maskData, 'base64');
 
-    // 组装 multipart/form-data
     const form = new FormData();
     form.append('model', model);
     form.append('prompt', prompt);
@@ -454,12 +549,16 @@ app.post('/api/inpaint', async (req, res) => {
     form.append('size', size);
     form.append('image', bgBuf, { filename: 'background.png', contentType: 'image/png' });
     form.append('mask',  maskBuf, { filename: 'mask.png',       contentType: 'image/png' });
+    if (characterReferenceImageBase64) {
+      const refData = String(characterReferenceImageBase64).replace(/^data:image\/\w+;base64,/, '');
+      const refBuf = Buffer.from(refData, 'base64');
+      form.append('image', refBuf, { filename: 'character-turnaround.png', contentType: 'image/png' });
+      console.log(`[/api/inpaint] character reference attached (${Math.round(refBuf.length / 1024)}KB)`);
+    }
 
-    // 带重试的请求（网络错误 / 524 / 502 / 冷却 时自动重试，最多 3 次）
+    // Inpaint 使用 multipart/form-data，不能用 fetchImageWithRetry（需要自定义 headers/body）
     let response;
-    const MAX_RETRIES = 3;
-
-    for (let attempts = 0; attempts <= MAX_RETRIES; attempts++) {
+    for (let attempts = 0; attempts <= IMAGE_MAX_RETRIES; attempts++) {
       try {
         response = await fetch(`${IMAGE_API_BASE}/images/edits`, {
           method: 'POST',
@@ -468,45 +567,37 @@ app.post('/api/inpaint', async (req, res) => {
             ...form.getHeaders(),
           },
           body: form.getBuffer(),
-          signal: AbortSignal.timeout(360_000), // 6分钟超时
+          signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS),
         });
 
-        if ((response.status === 524 || response.status === 502) && attempts < MAX_RETRIES) {
-          console.warn(`[/api/inpaint] HTTP ${response.status}, retrying (${attempts + 1}/${MAX_RETRIES})...`);
+        if ((response.status === 524 || response.status === 502) && attempts < IMAGE_MAX_RETRIES) {
+          console.warn(`[/api/inpaint] HTTP ${response.status}, retrying (${attempts + 1}/${IMAGE_MAX_RETRIES})...`);
           await new Promise(r => setTimeout(r, 5000));
           continue;
         }
 
-        // 检查响应体是否包含冷却错误
-        // model_cooldown = 凭证池完全耗尽，恢复需数小时，重试无意义
         if (!response.ok) {
           try {
             const errClone = response.clone();
             const errBody = await errClone.json();
-            const errMsg = JSON.stringify(errBody).toLowerCase();
-            if (errBody?.error?.code === 'model_cooldown') {
-              const resetSec = errBody?.error?.reset_seconds || 'unknown';
-              console.error(`[/api/inpaint] Model cooldown — all credentials exhausted. Reset in ~${resetSec}s. Do NOT retry.`);
-              return res.status(429).json({ error: `图片生成凭证池完全耗尽，预计 ${Math.round(resetSec / 60)} 分钟后恢复。请等待冷却结束后重试。`, resetSeconds: resetSec });
+            const cd = parseCooldownError(errBody);
+            if (cd?.isCooldown) {
+              console.error(`[/api/inpaint] Model cooldown — reset in ~${cd.resetSec}s. Do NOT retry.`);
+              return res.status(429).json({ error: `图片生成凭证池完全耗尽，预计 ${Math.round(cd.resetSec / 60)} 分钟后恢复。请等待冷却结束后重试。`, resetSeconds: cd.resetSec });
             }
-            if (errMsg.includes('cooling down') || errMsg.includes('rate_limit') || errMsg.includes('auth_unavailable')) {
+            if (cd?.shouldRetry) {
               const waitSec = (attempts + 1) * 10;
-              console.warn(`[/api/inpaint] Rate-limited, waiting ${waitSec}s then retrying (${attempts + 1}/${MAX_RETRIES})...`);
+              console.warn(`[/api/inpaint] Rate-limited, waiting ${waitSec}s...`);
               await new Promise(r => setTimeout(r, waitSec * 1000));
               continue;
             }
-          } catch {
-            // clone 失败，继续正常流程
-          }
+          } catch { /* clone failed */ }
         }
 
         break;
       } catch (fetchErr) {
-        const isSocketError = fetchErr?.cause?.code?.includes('SOCKET') ||
-                              fetchErr?.message?.includes('fetch failed') ||
-                              fetchErr?.code === 'UND_ERR_SOCKET';
-        if (isSocketError && attempts < MAX_RETRIES) {
-          console.warn(`[/api/inpaint] Network error: ${fetchErr.message}, retrying (${attempts + 1}/${MAX_RETRIES})...`);
+        if (isSocketError(fetchErr) && attempts < IMAGE_MAX_RETRIES) {
+          console.warn(`[/api/inpaint] Network error, retrying (${attempts + 1}/${IMAGE_MAX_RETRIES})...`);
           await new Promise(r => setTimeout(r, 3000));
           continue;
         }
@@ -514,58 +605,10 @@ app.post('/api/inpaint', async (req, res) => {
       }
     }
 
-    const contentType = response.headers.get('content-type') || '';
-    let data;
-    if (contentType.includes('application/json')) {
-      data = await response.json();
-    } else {
-      const rawText = await response.text();
-      console.error(`[/api/inpaint] Non-JSON response (status ${response.status}): ${rawText.slice(0, 500)}`);
-      return res.status(502).json({
-        error: { message: `Inpaint API 返回了非 JSON 响应 (HTTP ${response.status}): ${rawText.slice(0, 200)}` }
-      });
-    }
+    const parsed = await parseImageResponse(response, '[/api/inpaint]', req.body.frameName, 'inpaint');
+    if (parsed.error) return res.status(parsed.status).json(parsed.body);
 
-    if (!response.ok) {
-      console.error('[/api/inpaint] API error:', JSON.stringify(data).slice(0, 300));
-      // 如果 model 是 gpt-image-2 但 edits 不支持，自动降级提示
-      if (response.status === 400 || response.status === 404) {
-        console.warn('[/api/inpaint] Inpaint may not be supported by this model, returning error for fallback');
-      }
-      return res.status(response.status).json(data);
-    }
-
-    const item = data?.data?.[0];
-    console.log(`[/api/inpaint] success, item keys: ${item ? Object.keys(item) : 'none'}`);
-
-    // ── URL → base64 自动转换 ──
-    if (item && item.url && !item.b64_json) {
-      try {
-        console.log(`[/api/inpaint] Downloading image URL → base64: ${String(item.url).slice(0, 80)}...`);
-        const imgRes = await fetch(item.url, { signal: AbortSignal.timeout(30_000) });
-        if (imgRes.ok) {
-          const buf = Buffer.from(await imgRes.arrayBuffer());
-          item.b64_json = buf.toString('base64');
-          item._originalUrl = item.url;
-          delete item.url;
-          console.log(`[/api/inpaint] Converted to b64_json (${(buf.length / 1024).toFixed(0)}KB)`);
-        } else {
-          console.warn(`[/api/inpaint] Failed to download image URL: HTTP ${imgRes.status}`);
-        }
-      } catch (dlErr) {
-        console.warn(`[/api/inpaint] Failed to download image URL: ${dlErr.message}`);
-      }
-    }
-
-    // 自动落盘：把重绘结果保存到 output/frames
-    try {
-      const framePath = await saveFrameBase64(item?.b64_json, req.body.frameName, 'inpaint');
-      if (framePath && item) item.saved_path = framePath;
-    } catch (saveErr) {
-      console.warn(`[/api/inpaint] Failed to save frame: ${saveErr.message}`);
-    }
-
-    return res.json(data);
+    return res.json(parsed.data);
   } catch (err) {
     console.error('[/api/inpaint] error:', err);
     return res.status(500).json({ error: String(err) });
@@ -573,16 +616,48 @@ app.post('/api/inpaint', async (req, res) => {
 });
 
 // ─── 代理：下载图片转 base64（解决前端 CORS 限制） ───────────────────────
+const ALLOWED_IMAGE_HOSTS = new Set([
+  'oaidalleapiprodscus.blob.core.windows.net',
+  'cdn.openai.com',
+  'cdn.oaistatic.com',
+  'wzjself.org',
+  'img.openai.com',
+]);
+
+function isAllowedImageUrl(urlStr) {
+  try {
+    const parsed = new URL(urlStr);
+    if (parsed.protocol !== 'https:') return false;
+    if (ALLOWED_IMAGE_HOSTS.has(parsed.hostname)) return true;
+    // 允许 *.openai.com 和 *.wzjself.org 子域
+    if (parsed.hostname.endsWith('.openai.com') || parsed.hostname.endsWith('.wzjself.org')) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 app.post('/api/fetch-image', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
 
+  if (!isAllowedImageUrl(url)) {
+    console.warn(`[/api/fetch-image] Blocked disallowed URL: ${String(url).slice(0, 100)}`);
+    return res.status(403).json({ error: 'URL domain not in allowlist. Only known image CDN hosts are permitted.' });
+  }
+
   try {
-    const imgRes = await fetch(url);
+    const imgRes = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!imgRes.ok) return res.status(502).json({ error: `Failed to fetch image: ${imgRes.status}` });
 
     const contentType = imgRes.headers.get('content-type') || 'image/png';
+    if (!contentType.startsWith('image/')) {
+      return res.status(400).json({ error: 'URL did not return an image' });
+    }
     const buf = Buffer.from(await imgRes.arrayBuffer());
+    if (buf.length > 20 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Image too large (max 20MB)' });
+    }
     const b64 = buf.toString('base64');
     return res.json({ base64: `data:${contentType};base64,${b64}` });
   } catch (err) {
@@ -591,15 +666,17 @@ app.post('/api/fetch-image', async (req, res) => {
   }
 });
 
-  // ─── 代理：故事展开 + 按秒拆分段落 → ChatGPT 5.4 / OpenAI ───────────────
+// ─── 代理：故事展开 + 按秒拆分段落 ──────────────────────────────────────
 app.post('/api/story-expansion', async (req, res) => {
-  if (TEXT_PROVIDERS.length === 0) {
-    return res.status(500).json({ error: 'Server: OPENAI_API_KEY (or TEXT_API_KEY) not configured in .env' });
-  }
-
   const { synopsis, durationSeconds = 6 } = req.body;
   if (!synopsis?.trim()) {
     return res.status(400).json({ error: 'synopsis is required' });
+  }
+  if (synopsis.length > 5000) {
+    return res.status(400).json({ error: 'synopsis too long (max 5000 chars)' });
+  }
+  if (durationSeconds < 1 || durationSeconds > 30) {
+    return res.status(400).json({ error: 'durationSeconds must be between 1 and 30' });
   }
 
   const systemPrompt = `你是一位专业的编剧和故事导演。用户会给你一段故事梗概，你需要将其展开为一个完整的、有画面感的故事，并按时间拆分为 ${durationSeconds} 个段落（每个段落对应视频中的 1 秒）。
@@ -645,74 +722,42 @@ app.post('/api/story-expansion', async (req, res) => {
     max_tokens: 4096,
   };
 
-  let lastError = null;
-
-  for (const provider of TEXT_PROVIDERS) {
-    const MAX_RETRIES = 1;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        console.log(`[/api/story-expansion] synopsis="${String(synopsis).slice(0, 60)}...", duration=${durationSeconds}s, provider=${provider.name}`);
-        const data = await postTextCompletion(provider, body);
-        const content = data.choices?.[0]?.message?.content || '';
-        console.log(`[/api/story-expansion] response length: ${content.length}`);
-
-        // 解析 JSON，提取 fullStory 和 segments
-        let parsed;
-        try {
-          parsed = JSON.parse(content);
-        } catch {
-          // 降级：如果 JSON 解析失败，把整段文本当作 fullStory
-          console.warn('[/api/story-expansion] JSON parse failed, using raw text as fullStory');
-          return res.json({
-            fullStory: content,
-            segments: Array.from({ length: durationSeconds }, (_, i) => ({
-              index: i,
-              timeRange: `${i}s-${i + 1}s`,
-              description: '',
-            })),
-            raw: data,
-            provider: provider.name,
-          });
-        }
-
-        const fullStory = (typeof parsed.fullStory === 'string' && parsed.fullStory.trim()) ? parsed.fullStory : content;
-        const segments = Array.isArray(parsed.segments) && parsed.segments.length > 0 ? parsed.segments : Array.from({ length: durationSeconds }, (_, i) => ({
-          index: i,
-          timeRange: `${i}s-${i + 1}s`,
-          description: '',
-        }));
-
-        console.log(`[/api/story-expansion] story: ${fullStory.length} chars, segments: ${segments.length}`);
-        return res.json({ fullStory, segments, raw: data, provider: provider.name });
-      } catch (err) {
-        lastError = err;
-        const status = err?.status || 500;
-        const retryable = isRetryableTextResponse(status);
-
-        if (provider.name === 'primary' && retryable && attempt < MAX_RETRIES) {
-          console.warn(`[/api/story-expansion] ${provider.name} ${status}, retrying (${attempt + 1}/${MAX_RETRIES}):`, err.message);
-          await new Promise(r => setTimeout(r, 1500));
-          continue;
-        }
-
-        if (provider.name === 'primary' && retryable && TEXT_PROVIDERS.length > 1) {
-          console.warn(`[/api/story-expansion] primary failed (${status}), falling back to ${TEXT_PROVIDERS[1].name}`);
-          break;
-        }
-
-        if (provider.name !== 'primary') {
-          console.error('[/api/story-expansion] error:', err?.data || err?.rawText || err);
-          return res.status(status || 500).json({ error: String(err?.message || err), provider: provider.name });
-        }
-
-        console.error('[/api/story-expansion] error:', err?.data || err?.rawText || err);
-        return res.status(status || 500).json({ error: String(err?.message || err), provider: provider.name });
-      }
+  try {
+    console.log(`[/api/story-expansion] synopsis="${String(synopsis).slice(0, 60)}...", duration=${durationSeconds}s`);
+    const data = await withTextProviderFallback(body, '[/api/story-expansion]');
+    const content = data.choices?.[0]?.message?.content || '';
+    console.log(`[/api/story-expansion] response length: ${content.length}`);
+    if (!content.trim()) {
+      console.error('[/api/story-expansion] empty text response:', JSON.stringify(data).slice(0, 500));
+      return res.status(502).json({
+        error: `文本模型 ${TEXT_MODEL} 返回了空内容，请检查 OPENAI_API_BASE / OPENAI_API_KEY / TEXT_MODEL 配置或供应商响应格式。`,
+        raw: data,
+      });
     }
-  }
 
-  console.error('[/api/story-expansion] All retries exhausted');
-  return res.status(500).json(lastError || { error: 'All retries failed' });
+    const defaultSegments = Array.from({ length: durationSeconds }, (_, i) => ({
+      index: i,
+      timeRange: `${i}s-${i + 1}s`,
+      description: '',
+    }));
+
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      console.warn('[/api/story-expansion] JSON parse failed, using raw text as fullStory');
+      return res.json({ fullStory: content, segments: defaultSegments, raw: data });
+    }
+
+    const fullStory = (typeof parsed.fullStory === 'string' && parsed.fullStory.trim()) ? parsed.fullStory : content;
+    const segments = Array.isArray(parsed.segments) && parsed.segments.length > 0 ? parsed.segments : defaultSegments;
+
+    console.log(`[/api/story-expansion] story: ${fullStory.length} chars, segments: ${segments.length}`);
+    return res.json({ fullStory, segments, raw: data });
+  } catch (err) {
+    const status = err?.status || 500;
+    return res.status(status).json({ error: String(err?.message || err) });
+  }
 });
 
 // 视频合成功能已移除；如果需要可单独实现为离线工具。

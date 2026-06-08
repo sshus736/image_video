@@ -18,11 +18,14 @@ export function GenerationProgress({
 
   const steps = [
     { key: 'expanding-story', label: '展开完整剧情', icon: '📖' },
-    { key: 'generating-script', label: '生成分镜脚本', icon: '📝' },
+    { key: 'generating-script', label: '生成分镜与统一背景', icon: '📝' },
+    { key: 'background-ready', label: '确认统一背景', icon: '🖼️' },
+    { key: 'generating-character', label: '生成人物三视图', icon: '👤' },
+    { key: 'character-ready', label: '确认人物三视图', icon: '✅' },
     { key: 'generating-images', label: `生成图像 (${completedShots}/${totalShots})`, icon: '🎨' },
   ];
 
-  const stepOrder: GenerationStep[] = ['expanding-story', 'generating-script', 'generating-images'];
+  const stepOrder: GenerationStep[] = ['expanding-story', 'generating-script', 'background-ready', 'generating-character', 'character-ready', 'generating-images'];
   const currentIdx = stepOrder.indexOf(step);
 
   return (

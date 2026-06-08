@@ -10,6 +10,9 @@ node_modules/
 dist/
 output/
 
+# 无关工作流文件
+new_workflow.json
+
 # 系统文件
 .DS_Store
 Thumbs.db

@@ -2,7 +2,6 @@ import { useState } from 'react';
 import { Settings, Cpu, Film, Clock, Palette, Move, Maximize2 } from 'lucide-react';
 import type { AppSettings } from '../types/storyboard';
 import { STYLES, FPS_OPTIONS, DURATION_OPTIONS, VARIATION_OPTIONS, IMAGE_SIZE_OPTIONS } from '../types/storyboard';
-import { saveSettings } from '../lib/openai';
 
 interface SettingsPanelProps {
   settings: AppSettings;
@@ -13,9 +12,7 @@ export function SettingsPanel({ settings, onUpdate }: SettingsPanelProps) {
   const [open, setOpen] = useState(false);
 
   function handleChange(field: keyof AppSettings, value: string | number) {
-    const updated = { ...settings, [field]: value };
-    onUpdate(updated);
-    saveSettings(updated);
+    onUpdate({ ...settings, [field]: value });
   }
 
   return (

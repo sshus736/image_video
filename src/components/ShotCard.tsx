@@ -22,7 +22,10 @@ interface ShotCardProps {
     shotId: string,
     editedPrompt?: string,
     modificationPrompt?: string,
-    referenceImageUrl?: string
+    referenceImageUrl?: string,
+    bgImageUrl?: string,
+    maskUrl?: string,
+    imageSize?: string,
   ) => void;
   isGeneratingAll: boolean;
 }
@@ -43,7 +46,18 @@ export function ShotCard({ shot, onGenerateImage, isGeneratingAll }: ShotCardPro
   }, [shot.imageUrl]);
 
   async function copyText(text: string, field: string) {
-    await navigator.clipboard.writeText(text);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // 降级：textarea + execCommand（非 HTTPS 环境）
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;left:-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
     setCopiedField(field);
     setTimeout(() => setCopiedField(null), 2000);
   }

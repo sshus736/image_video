@@ -1,14 +1,16 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Film, Sparkles, ImageIcon, Play, Download, Layers, AlertCircle } from 'lucide-react';
+import { Film, Sparkles, ImageIcon, Play, Download, Layers, AlertCircle, XCircle } from 'lucide-react';
 import './App.css';
 
 import type { Shot, StoryboardProject, GenerationStep, AppSettings } from './types/storyboard';
 import {
   generateFullStory,
   generateStoryboardScript,
+  generateCharacterTurnaround,
   generateShotImage,
   saveProject,
   loadProjects,
+  deleteProject,
   loadSettings,
   saveSettings,
 } from './lib/openai';
@@ -43,12 +45,25 @@ function App() {
 
   // 固定背景图（背景分离方案）
   const [backgroundImageUrl, setBackgroundImageUrl] = useState<string | undefined>();
+  const [characterTurnaroundUrl, setCharacterTurnaroundUrl] = useState<string | undefined>();
+  const [characterTurnaroundPrompt, setCharacterTurnaroundPrompt] = useState<string | undefined>();
 
   // 用 ref 跟踪最新的 shots，避免 generateSingleImage 闭包过期
   const shotsRef = useRef<Shot[]>([]);
   shotsRef.current = shots;
   const backgroundImageRef = useRef<string | undefined>(undefined);
   backgroundImageRef.current = backgroundImageUrl;
+  const characterTurnaroundRef = useRef<string | undefined>(undefined);
+  characterTurnaroundRef.current = characterTurnaroundUrl;
+
+  // 取消生成
+  const abortControllerRef = useRef<AbortController | null>(null);
+  function handleCancel() {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setError('用户已取消生成');
+    setStep('error');
+  }
 
   // 保存项目到 localStorage（不存 base64 图片数据，只存元数据）
   useEffect(() => {
@@ -66,22 +81,42 @@ function App() {
   // ─── 完整流程：梗概 → 展开故事(按秒分段) → 分镜提示词 → 生图 ───────────
   const handleGenerate = useCallback(
     async (prompt: string, style: string, fps: number, durationSeconds: number) => {
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
       setStep('expanding-story');
       setError(undefined);
       setShots([]);
       setCompletedImageCount(0);
       setFullStory('');
+      setBackgroundImageUrl(undefined);
+      setCharacterTurnaroundUrl(undefined);
+      setCharacterTurnaroundPrompt(undefined);
       setCurrentFps(fps);
+
+      // 检查是否已取消
+      function checkAborted() {
+        if (controller.signal.aborted) throw new Error('用户已取消生成');
+      }
 
       try {
         // ── Step 1: 展开故事 + 按秒拆分段落 ──
         const { fullStory: story, segments } = await generateFullStory(prompt, durationSeconds);
+        checkAborted();
         setFullStory(story);
         setStep('generating-script');
 
         // ── Step 2: 为每个段落的每帧生成分镜提示词（同时生成固定背景图）──
         const { shots: newShots, backgroundImageUrl: bgUrl, backgroundPrompt: bgPrompt } =
           await generateStoryboardScript(segments, style, fps, settings.frameVariation, settings.imageSize);
+        checkAborted();
+
+        if (!bgUrl) {
+          throw new Error('统一背景图生成失败。请检查图像接口，或重新生成分镜。');
+        }
+        if (!newShots.some((shot) => !!shot.maskImageUrl)) {
+          throw new Error('人物蒙版生成失败，无法在统一背景上添加人物。请重新生成分镜。');
+        }
 
         // 存储背景图（供逐帧 inpaint 使用）
         setBackgroundImageUrl(bgUrl);
@@ -102,158 +137,158 @@ function App() {
 
         setCurrentProject(project);
         setShots(newShots);
-        shotsRef.current = newShots; // 手动同步 ref，避免 generateSingleImage 闭包读到空数组
-        setStep('generating-images');
-
-        // ── Step 3: 并发生成所有帧图像（3 并发） ──
-        await generateImagesInBatches(newShots, 3, settings.imageSize);
-        setStep('done');
+        shotsRef.current = newShots;
+        setStep('background-ready');
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('[handleGenerate] error:', msg);
         setError(msg);
         setStep('error');
-        // 不自动恢复，让用户看到错误信息
+      } finally {
+        if (abortControllerRef.current === controller) {
+          abortControllerRef.current = null;
+        }
       }
     },
     [settings]
   );
 
-  // ─── 批量生成图像（段主帧 + 参考图链 方案） ────────────────────────────────
-  // 策略：
-  //   Phase 1: 逐段串行生成每段的"主帧"（第1帧），段间用前一帧作参考图锚定
-  //   Phase 2: 段内剩余帧并发生成，统一使用本段主帧作为参考图
-  //
-  // 核心理念：先产生主体图片，后续所有帧都在主体图片上微调，而非重新生成。
-  //   有背景图时，主帧走 inpaint（背景+蒙版+提示词），保证背景绝对固定；
-  //   无背景图时，主帧走直接生图。后续帧统一走「参考图 + 图生图」模式。
-  //
-  // 快速失败：连续 3 帧失败则中止，避免长时间无响应
-  async function generateImagesInBatches(shotList: Shot[], concurrency: number, imageSize: string = '1024x1024') {
+  async function handleGenerateCharacterTurnaround() {
+    if (!shotsRef.current.length || !currentProject) return;
+
+    const characterDescription = shotsRef.current
+      .map((shot) => shot.characterDescription)
+      .find((desc) => !!desc?.trim()) || '';
+
+    if (!characterDescription.trim()) {
+      setError('缺少人物描述，无法生成人物三视图。请重新生成分镜。');
+      setStep('error');
+      return;
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    setError(undefined);
+    setStep('generating-character');
+
+    try {
+      const result = await generateCharacterTurnaround(characterDescription, currentProject.style, settings.imageSize);
+      if (controller.signal.aborted) throw new Error('用户已取消生成');
+      setCharacterTurnaroundUrl(result.imageUrl);
+      setCharacterTurnaroundPrompt(result.prompt);
+      setCurrentProject((prev) => prev ? {
+        ...prev,
+        characterTurnaroundUrl: result.imageUrl,
+        characterTurnaroundPrompt: result.prompt,
+      } : prev);
+      setStep('character-ready');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+      setStep('error');
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+    }
+  }
+
+  async function handleGenerateCharacters() {
+    if (!shotsRef.current.length) return;
+    if (!backgroundImageRef.current) {
+      setError('统一背景图尚未生成，不能进入人物生成。请重新生成分镜。');
+      setStep('error');
+      return;
+    }
+
+    const hasMask = shotsRef.current.some((shot) => !!shot.maskImageUrl);
+    if (!hasMask) {
+      setError('人物蒙版尚未生成，不能在统一背景上添加人物。请重新生成分镜。');
+      setStep('error');
+      return;
+    }
+    if (!characterTurnaroundRef.current) {
+      setError('人物三视图尚未确认，不能进入逐帧人物生成。');
+      setStep('error');
+      return;
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    setError(undefined);
+    setCompletedImageCount(shotsRef.current.filter(s => s.imageStatus === 'done' && s.imageUrl).length);
+    setStep('generating-images');
+
+    try {
+      await generateImagesInBatches(shotsRef.current, 1, settings.imageSize, controller.signal);
+      if (controller.signal.aborted) throw new Error('用户已取消生成');
+      setStep('done');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+      setStep('error');
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+    }
+  }
+
+  // ─── 批量生成图像：首帧统一背景 inpaint，后续用上一帧做图生图参考 ────────
+  // 首帧负责把角色稳定放进统一背景；后续帧只做小幅动作增量，提升逐帧连续感。
+  async function generateImagesInBatches(shotList: Shot[], _concurrency: number, imageSize: string = '1024x1024', signal?: AbortSignal) {
     let failCount = 0;
     let consecutiveFails = 0;
     const MAX_CONSECUTIVE_FAILS = 3;
     const bgUrl = backgroundImageRef.current;
-    const effectiveConcurrency = 1; // 串行避免凭证池冷却
+    let lastReferenceImageUrl: string | undefined;
 
-    // 按段分组（保持 segmentIndex 排序）
-    const segGroups = new Map<number, Shot[]>();
-    for (const shot of shotList) {
-      if (!segGroups.has(shot.segmentIndex)) segGroups.set(shot.segmentIndex, []);
-      segGroups.get(shot.segmentIndex)!.push(shot);
+    if (!bgUrl) {
+      throw new Error('缺少统一背景图，已停止生成，避免背景不一致。');
     }
-    const segEntries = Array.from(segGroups.entries()).sort(([a], [b]) => a - b);
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 1: 逐段生成「主帧」（每段第 1 帧）—— 串行以保证跨段参考链
-    // ═══════════════════════════════════════════════════════════════════════════
-    let crossSegmentRef: string | undefined; // 上一段主帧的 imageUrl
+    const orderedShots = [...shotList].sort((a, b) => (a.index || 0) - (b.index || 0));
 
-    for (const [segIdx, segShots] of segEntries) {
+    for (let i = 0; i < orderedShots.length; i++) {
+      if (signal?.aborted) throw new Error('用户已取消生成');
       if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
         console.error(`[generateImagesInBatches] 连续 ${MAX_CONSECUTIVE_FAILS} 帧失败，中止生成`);
-        setError(`连续 ${MAX_CONSECUTIVE_FAILS} 帧图像生成失败，可能 API 不可用或被限流。请稍后重试。`);
-        setStep('error');
-        return;
+        throw new Error(`连续 ${MAX_CONSECUTIVE_FAILS} 帧人物生成失败，可能 inpaint 接口不可用或被限流。`);
       }
 
-      const firstShot = segShots[0];
-      if (!firstShot) continue;
+      const shot = orderedShots[i];
+      if (!shot.maskImageUrl) {
+        throw new Error(`第 ${shot.index} 帧缺少人物蒙版，已停止生成。`);
+      }
 
-      try {
-        if (segIdx === 0) {
-          // 第一段主帧：走 inpaint（背景分离）或直接生图
-          if (bgUrl && firstShot.maskImageUrl) {
-            console.log(`[generateImagesInBatches] Segment ${segIdx} master: inpaint (background + mask)`);
-            await generateSingleImage(firstShot.id, undefined, undefined, undefined, bgUrl, firstShot.maskImageUrl, imageSize);
-          } else {
-            console.log(`[generateImagesInBatches] Segment ${segIdx} master: direct generation (no background)`);
-            await generateSingleImage(firstShot.id, undefined, undefined, undefined, undefined, undefined, imageSize);
-          }
-        } else {
-          // 后续段主帧：用上一段主帧作参考图（图生图），保持跨段角色一致性
-          console.log(`[generateImagesInBatches] Segment ${segIdx} master: reference-based (cross-segment anchor)`);
-          await generateSingleImage(firstShot.id, undefined, undefined, crossSegmentRef, undefined, undefined, imageSize);
-        }
-
-        // 获取刚生成的主帧 URL，作为跨段参考链
-        const updated = shotsRef.current.find(s => s.id === firstShot.id);
-        if (updated?.imageUrl) {
-          crossSegmentRef = updated.imageUrl;
-        }
+      const before = shotsRef.current.find(s => s.id === shot.id);
+      if (before?.imageStatus === 'done' && before.imageUrl) {
+        lastReferenceImageUrl = before.imageUrl;
         consecutiveFails = 0;
-      } catch (err) {
-        console.error(`[generateImagesInBatches] Segment ${segIdx} master frame failed:`, err);
-        failCount++;
-        consecutiveFails++;
-        // 主帧失败时尝试降级：用上一段主帧作参考图重试
-        if (crossSegmentRef && consecutiveFails < MAX_CONSECUTIVE_FAILS) {
-          try {
-            console.warn(`[generateImagesInBatches] Retrying segment ${segIdx} master with cross-segment ref fallback`);
-            await generateSingleImage(firstShot.id, undefined, undefined, crossSegmentRef, undefined, undefined, imageSize);
-            const retryUpdated = shotsRef.current.find(s => s.id === firstShot.id);
-            if (retryUpdated?.imageUrl) crossSegmentRef = retryUpdated.imageUrl;
-            consecutiveFails = 0;
-          } catch (retryErr) {
-            console.error(`[generateImagesInBatches] Segment ${segIdx} master retry also failed:`, retryErr);
-            failCount++;
-            consecutiveFails++;
-          }
-        }
         continue;
       }
 
-      // ═══════════════════════════════════════════════════════════════════════
-      // Phase 2: 段内剩余帧 —— 统一用本段主帧作参考图（可并发生成）
-      // ═══════════════════════════════════════════════════════════════════════
-      const segmentMasterUrl = shotsRef.current.find(s => s.id === firstShot.id)?.imageUrl;
-
-      if (segShots.length <= 1 || !segmentMasterUrl) continue;
-
-      const remainingShots = segShots.slice(1);
-      const batchSize = Math.max(effectiveConcurrency, 1);
-
-      for (let j = 0; j < remainingShots.length; j += batchSize) {
-        if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
-          console.error(`[generateImagesInBatches] 连续 ${MAX_CONSECUTIVE_FAILS} 帧失败，中止生成`);
-          setError(`连续 ${MAX_CONSECUTIVE_FAILS} 帧图像生成失败，可能 API 不可用或被限流。请稍后重试。`);
-          setStep('error');
-          return;
+      try {
+        if (!lastReferenceImageUrl) {
+          console.log(`[generateImagesInBatches] Frame ${shot.index}: master frame via inpaint on unified background`);
+          lastReferenceImageUrl = await generateSingleImage(shot.id, undefined, undefined, undefined, bgUrl, shot.maskImageUrl, imageSize);
+        } else {
+          console.log(`[generateImagesInBatches] Frame ${shot.index}: image-to-image from previous frame`);
+          lastReferenceImageUrl = await generateSingleImage(shot.id, undefined, undefined, lastReferenceImageUrl, undefined, undefined, imageSize);
         }
 
-        const batch = remainingShots.slice(j, j + batchSize);
-        const results = await Promise.allSettled(batch.map(async (shot) => {
-          try {
-            // 所有段内剩余帧统一使用本段主帧作为参考图进行图生图微调
-            await generateSingleImage(shot.id, undefined, undefined, segmentMasterUrl, undefined, undefined, imageSize);
-            return true;
-          } catch (err) {
-            console.error(`[generateImagesInBatches] frame ${shot.index} failed:`, err);
-            return false;
-          }
-        }));
-
-        for (const r of results) {
-          if (r.status === 'fulfilled' && r.value === false) {
-            failCount++;
-            consecutiveFails++;
-          } else if (r.status === 'rejected') {
-            failCount++;
-            consecutiveFails++;
-          } else {
-            consecutiveFails = 0;
-          }
+        if (!lastReferenceImageUrl) {
+          throw new Error(`第 ${shot.index} 帧生成后缺少图片结果，无法作为下一帧参考。`);
         }
-
-        // 每批之间等待 5 秒，避免触发代理凭证池冷却
-        if (j + batchSize < remainingShots.length) {
-          await new Promise(r => setTimeout(r, 5000));
-        }
+        consecutiveFails = 0;
+      } catch (err) {
+        console.error(`[generateImagesInBatches] frame ${shot.index} failed:`, err);
+        failCount++;
+        consecutiveFails++;
       }
 
-      // 段间等待 8 秒，让凭证池恢复
-      if (segIdx < segEntries.length - 1) {
-        await new Promise(r => setTimeout(r, 8000));
+      if (i < orderedShots.length - 1) {
+        await new Promise(r => setTimeout(r, 3000));
       }
     }
 
@@ -272,7 +307,7 @@ function App() {
       bgImageUrl?: string,
       maskUrl?: string,
       imageSize?: string,
-    ) => {
+    ): Promise<string | undefined> => {
       const shot = shotsRef.current.find((s) => s.id === shotId);
       if (!shot) {
         console.warn(`[generateSingleImage] shot not found: ${shotId}, ref has ${shotsRef.current.length} shots`);
@@ -299,6 +334,8 @@ function App() {
           effectiveBgUrl,
           effectiveMask,
           imageSize,
+          !!(bgImageUrl && maskUrl && !referenceImageUrl && !editedPrompt?.trim() && !modificationPrompt?.trim()),
+          bgImageUrl && maskUrl ? characterTurnaroundRef.current : undefined,
         );
 
         // 更新 imagePrompt
@@ -326,6 +363,7 @@ function App() {
           )
         );
         setCompletedImageCount((c) => c + 1);
+        return imageUrl;
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         setShots((prev) =>
@@ -335,6 +373,7 @@ function App() {
               : s
           )
         );
+        throw err;
       }
     },
     [] // 无外部依赖，通过 shotsRef 读取最新 shots
@@ -347,25 +386,157 @@ function App() {
     setCurrentProject(project);
     setShots(project.shots);
     setFullStory(project.fullStory || '');
+    setBackgroundImageUrl(project.backgroundImageUrl);
+    setCharacterTurnaroundUrl(project.characterTurnaroundUrl);
+    setCharacterTurnaroundPrompt(project.characterTurnaroundPrompt);
     setCurrentFps(project.fps || 8);
+    setError(undefined);
+    setCompletedImageCount(project.shots.filter(s => s.imageStatus === 'done').length);
     setStep('done');
   }
 
-  // ─── 下载图像 ──────────────────────────────────────────────────────────────
-  function downloadImages() {
-    shots.forEach((shot) => {
-      if (shot.imageStatus === 'done' && shot.imageUrl) {
-        const a = document.createElement('a');
-        a.href = shot.imageUrl;
-        a.download = `shot_${shot.index}_seg${shot.segmentIndex}_${shot.shotType.replace(/\s+/g, '_')}.png`;
-        a.click();
+  // ─── 下载图像（ZIP 打包，避免浏览器拦截多文件下载） ──────────────────────────
+  async function downloadImages() {
+    const doneShots = shots.filter((s) => s.imageStatus === 'done' && s.imageUrl);
+    if (doneShots.length === 0) return;
+
+    try {
+      // 构建 ZIP 文件（仅使用 Stored 模式，无需压缩库）
+      const files: { name: string; data: Uint8Array }[] = [];
+
+      for (const shot of doneShots) {
+        const resp = await fetch(shot.imageUrl!);
+        const blob = await resp.blob();
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        const name = `shot_${String(shot.index).padStart(3, '0')}_seg${shot.segmentIndex}_${shot.shotType.replace(/\s+/g, '_')}.png`;
+        files.push({ name, data: buf });
       }
-    });
+
+      const zip = buildZip(files);
+      const blob = new Blob([new Uint8Array(zip)], { type: 'application/zip' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `storyboard_${Date.now()}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('[downloadImages] ZIP failed, falling back to individual:', err);
+      // 降级：逐个下载（间隔 500ms 避免拦截）
+      for (const shot of doneShots) {
+        if (shot.imageUrl) {
+          const a = document.createElement('a');
+          a.href = shot.imageUrl;
+          a.download = `shot_${String(shot.index).padStart(3, '0')}_seg${shot.segmentIndex}.png`;
+          a.click();
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+    }
+  }
+
+  /** 构建最小 ZIP 文件（Stored 模式，无压缩） */
+  function buildZip(files: { name: string; data: Uint8Array }[]): Uint8Array {
+    const encoder = new TextEncoder();
+    const entries: { header: Uint8Array; data: Uint8Array; offset: number }[] = [];
+    let offset = 0;
+
+    for (const file of files) {
+      const nameBytes = encoder.encode(file.name);
+      // Local file header (30 + name + data)
+      const header = new Uint8Array(30 + nameBytes.length);
+      const hv = new DataView(header.buffer);
+      hv.setUint32(0, 0x04034b50, true);  // signature
+      hv.setUint16(4, 20, true);           // version needed
+      hv.setUint16(6, 0, true);            // flags
+      hv.setUint16(8, 0, true);            // compression: stored
+      hv.setUint16(10, 0, true);           // mod time
+      hv.setUint16(12, 0, true);           // mod date
+      hv.setUint32(14, crc32(file.data), true);
+      hv.setUint32(18, file.data.length, true);
+      hv.setUint32(22, file.data.length, true);
+      hv.setUint16(26, nameBytes.length, true);
+      hv.setUint16(28, 0, true);           // extra length
+      header.set(nameBytes, 30);
+      entries.push({ header, data: file.data, offset });
+      offset += header.length + file.data.length;
+    }
+
+    // Central directory
+    const centralParts: Uint8Array[] = [];
+    let centralSize = 0;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const entry = entries[i];
+      const nameBytes = encoder.encode(file.name);
+      const cd = new Uint8Array(46 + nameBytes.length);
+      const dv = new DataView(cd.buffer);
+      dv.setUint32(0, 0x02014b50, true);   // central directory signature
+      dv.setUint16(4, 20, true);            // version made by
+      dv.setUint16(6, 20, true);            // version needed
+      dv.setUint16(8, 0, true);             // flags
+      dv.setUint16(10, 0, true);            // compression
+      dv.setUint16(12, 0, true);            // mod time
+      dv.setUint16(14, 0, true);            // mod date
+      dv.setUint32(16, crc32(file.data), true);
+      dv.setUint32(20, file.data.length, true);
+      dv.setUint32(24, file.data.length, true);
+      dv.setUint16(28, nameBytes.length, true);
+      dv.setUint16(30, 0, true);            // extra length
+      dv.setUint16(32, 0, true);            // comment length
+      dv.setUint16(34, 0, true);            // disk number
+      dv.setUint16(36, 0, true);            // internal attrs
+      dv.setUint32(38, 0, true);            // external attrs
+      dv.setUint32(42, entry.offset, true); // relative offset
+      cd.set(nameBytes, 46);
+      centralParts.push(cd);
+      centralSize += cd.length;
+    }
+
+    // End of central directory
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    ev.setUint32(0, 0x06054b50, true);
+    ev.setUint16(4, 0, true);
+    ev.setUint16(6, 0, true);
+    ev.setUint16(8, files.length, true);
+    ev.setUint16(10, files.length, true);
+    ev.setUint32(12, centralSize, true);
+    ev.setUint32(16, offset, true);
+    ev.setUint16(20, 0, true);
+
+    // Concatenate all parts
+    const totalSize = offset + centralSize + 22;
+    const result = new Uint8Array(totalSize);
+    let pos = 0;
+    for (const entry of entries) {
+      result.set(entry.header, pos); pos += entry.header.length;
+      result.set(entry.data, pos); pos += entry.data.length;
+    }
+    for (const cd of centralParts) {
+      result.set(cd, pos); pos += cd.length;
+    }
+    result.set(eocd, pos);
+    return result;
+  }
+
+  /** CRC-32 校验 */
+  function crc32(data: Uint8Array): number {
+    let crc = 0xffffffff;
+    for (let i = 0; i < data.length; i++) {
+      crc ^= data[i];
+      for (let j = 0; j < 8; j++) {
+        crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+      }
+    }
+    return (crc ^ 0xffffffff) >>> 0;
   }
 
   const isGenerating = step === 'expanding-story' || step === 'generating-script' || step === 'generating-images';
   const doneImageCount = shots.filter((s) => s.imageStatus === 'done' && s.imageUrl).length;
   const isStepError = step === 'error';
+  const isBackgroundReady = step === 'background-ready';
+  const isCharacterReady = step === 'character-ready';
 
   // 按段落分组 shots（用于显示）
   const segmentGroups = (() => {
@@ -458,7 +629,7 @@ function App() {
                   </div>
                   <div>
                     <p className="text-sm font-semibold text-emerald-300">完整剧情</p>
-                    <p className="text-[10px] text-white/30">ChatGPT 5.4 根据梗概展开</p>
+                    <p className="text-[10px] text-white/30">ChatGPT 5.5 根据梗概展开</p>
                   </div>
                 </div>
                 <div className="max-h-60 overflow-y-auto text-xs text-white/60 leading-relaxed whitespace-pre-wrap bg-white/3 rounded-xl px-3 py-2.5 border border-white/5">
@@ -502,8 +673,8 @@ function App() {
                   <li>1. 输入故事梗概（几句话即可）</li>
                   <li>2. 选择画面风格、帧率和视频时长</li>
                   <li>3. AI 自动将故事拆分为逐秒段落</li>
-                  <li>4. 为每秒生成 N 帧图像</li>
-                  <li>5. 下载生成的图像</li>
+                  <li>4. 先生成并确认统一背景图</li>
+                  <li>5. 在同一背景上逐帧添加人物</li>
                 </ol>
               </div>
             )}
@@ -512,7 +683,10 @@ function App() {
             <HistoryPanel
               projects={projects}
               onLoad={handleLoadProject}
-              onDelete={(id) => setProjects(loadProjects().filter((p) => p.id !== id))}
+              onDelete={(id) => {
+                deleteProject(id);
+                setProjects(loadProjects());
+              }}
             />
           </div>
 
@@ -560,6 +734,11 @@ function App() {
                       </h2>
                       <p className="text-xs text-white/35 mt-0.5">
                         {segmentGroups.length} 段 · {shots.length} 帧 · {currentFps}fps · {currentProject.durationSeconds}s · {currentProject.style}
+                        {doneImageCount < shots.length && step === 'done' && (
+                          <span className="ml-2 text-amber-400/70">
+                            · {shots.length - doneImageCount} 帧待生成
+                          </span>
+                        )}
                       </p>
                     </div>
                     <div className="flex items-center gap-1.5">
@@ -570,7 +749,22 @@ function App() {
                       )}
                       {step === 'generating-script' && (
                         <span className="text-xs text-amber-400 animate-pulse">
-                          生成分镜脚本中...
+                          生成分镜与统一背景中...
+                        </span>
+                      )}
+                      {step === 'background-ready' && (
+                        <span className="text-xs text-blue-400">
+                          统一背景已生成，等待确认
+                        </span>
+                      )}
+                      {step === 'generating-character' && (
+                        <span className="text-xs text-fuchsia-400 animate-pulse">
+                          生成人物三视图中...
+                        </span>
+                      )}
+                      {step === 'character-ready' && (
+                        <span className="text-xs text-fuchsia-300">
+                          人物三视图已生成，等待确认
                         </span>
                       )}
                       {step === 'generating-images' && (
@@ -589,6 +783,118 @@ function App() {
                           已完成
                         </span>
                       )}
+                      {isGenerating && (
+                        <button
+                          onClick={handleCancel}
+                          className="text-xs px-2.5 py-1 rounded-lg border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors flex items-center gap-1"
+                        >
+                          <XCircle size={12} />
+                          取消
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {isBackgroundReady && currentProject && (
+                  <div className="mb-5 rounded-2xl border border-blue-500/25 bg-blue-500/8 overflow-hidden">
+                    <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-0">
+                      <div className="bg-black/30">
+                        {backgroundImageUrl ? (
+                          <img
+                            src={backgroundImageUrl}
+                            alt="统一背景"
+                            className="w-full h-full min-h-[180px] object-cover"
+                          />
+                        ) : (
+                          <div className="min-h-[180px] flex items-center justify-center text-xs text-white/35">
+                            背景图未生成
+                          </div>
+                        )}
+                      </div>
+                      <div className="p-5">
+                        <div className="flex items-center gap-2 mb-2">
+                          <ImageIcon size={16} className="text-blue-300" />
+                          <h3 className="text-sm font-semibold text-blue-200">统一背景确认</h3>
+                        </div>
+                        <p className="text-xs text-white/55 leading-relaxed mb-3">
+                          分镜脚本已经生成。接下来所有帧会基于左侧这张同一背景图添加人物，不再重新生成整张画面，以减少背景漂移。
+                        </p>
+                        {currentProject.backgroundPrompt && (
+                          <div className="mb-4 rounded-xl border border-white/8 bg-white/5 px-3 py-2">
+                            <p className="text-[10px] uppercase tracking-wide text-white/25 mb-1">Background Prompt</p>
+                            <p className="text-xs text-white/45 line-clamp-3">{currentProject.backgroundPrompt}</p>
+                          </div>
+                        )}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            onClick={handleGenerateCharacterTurnaround}
+                            disabled={!backgroundImageUrl || isGenerating}
+                            className="px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold transition-colors flex items-center gap-2"
+                          >
+                            <Play size={14} />
+                            下一步：生成人物三视图
+                          </button>
+                          <button
+                            onClick={() => { setError(undefined); setStep('idle'); }}
+                            className="px-4 py-2.5 rounded-xl border border-white/10 text-white/55 hover:bg-white/5 text-sm transition-colors"
+                          >
+                            重新生成分镜
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {isCharacterReady && currentProject && (
+                  <div className="mb-5 rounded-2xl border border-fuchsia-500/25 bg-fuchsia-500/8 overflow-hidden">
+                    <div className="grid grid-cols-1 md:grid-cols-[260px_1fr] gap-0">
+                      <div className="bg-black/30">
+                        {characterTurnaroundUrl ? (
+                          <img
+                            src={characterTurnaroundUrl}
+                            alt="人物三视图"
+                            className="w-full h-full min-h-[220px] object-contain"
+                          />
+                        ) : (
+                          <div className="min-h-[220px] flex items-center justify-center text-xs text-white/35">
+                            人物三视图未生成
+                          </div>
+                        )}
+                      </div>
+                      <div className="p-5">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Sparkles size={16} className="text-fuchsia-300" />
+                          <h3 className="text-sm font-semibold text-fuchsia-200">人物三视图确认</h3>
+                        </div>
+                        <p className="text-xs text-white/55 leading-relaxed mb-3">
+                          后续每一帧都会以这张三视图作为人物身份参考，并把人物添加到统一背景的蒙版区域内，减少脸、服装和体型跑偏。
+                        </p>
+                        {characterTurnaroundPrompt && (
+                          <div className="mb-4 rounded-xl border border-white/8 bg-white/5 px-3 py-2">
+                            <p className="text-[10px] uppercase tracking-wide text-white/25 mb-1">Character Reference Prompt</p>
+                            <p className="text-xs text-white/45 line-clamp-4">{characterTurnaroundPrompt}</p>
+                          </div>
+                        )}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            onClick={handleGenerateCharacters}
+                            disabled={!characterTurnaroundUrl || isGenerating}
+                            className="px-4 py-2.5 rounded-xl bg-fuchsia-600 hover:bg-fuchsia-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold transition-colors flex items-center gap-2"
+                          >
+                            <Play size={14} />
+                            确认人物，生成所有帧
+                          </button>
+                          <button
+                            onClick={handleGenerateCharacterTurnaround}
+                            disabled={isGenerating}
+                            className="px-4 py-2.5 rounded-xl border border-fuchsia-500/25 text-fuchsia-200 hover:bg-fuchsia-500/10 disabled:opacity-40 text-sm transition-colors"
+                          >
+                            重新生成三视图
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -617,7 +923,7 @@ function App() {
                             key={shot.id}
                             shot={shot}
                             onGenerateImage={generateSingleImage}
-                            isGeneratingAll={isGenerating}
+                            isGeneratingAll={isGenerating || isBackgroundReady || isCharacterReady}
                           />
                         ))}
                       </div>

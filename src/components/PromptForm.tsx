@@ -2,7 +2,6 @@ import { useState } from 'react';
 import { Wand2, Palette, Sliders, Clock, Film, Move, Maximize2 } from 'lucide-react';
 import type { AppSettings } from '../types/storyboard';
 import { STYLES, FPS_OPTIONS, DURATION_OPTIONS, VARIATION_OPTIONS, IMAGE_SIZE_OPTIONS } from '../types/storyboard';
-import { saveSettings } from '../lib/openai';
 
 interface PromptFormProps {
   settings: AppSettings;
@@ -27,7 +26,17 @@ export function PromptForm({ settings, onGenerate, onUpdateSettings, isGeneratin
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!prompt.trim() || isGenerating) return;
-    onGenerate(prompt.trim(), style, fps, durationSeconds);
+    const trimmed = prompt.trim();
+    if (trimmed.length > 2000) {
+      alert('故事梗概过长，请控制在 2000 字以内');
+      return;
+    }
+    const totalFrames = fps * durationSeconds;
+    if (totalFrames > 200) {
+      alert(`总帧数 ${totalFrames} 过多（上限 200 帧），请降低帧率或缩短时长`);
+      return;
+    }
+    onGenerate(trimmed, style, fps, durationSeconds);
   }
 
   const totalFrames = fps * durationSeconds;
@@ -144,9 +153,7 @@ export function PromptForm({ settings, onGenerate, onUpdateSettings, isGeneratin
               key={opt.value}
               type="button"
               onClick={() => {
-                const updated = { ...settings, frameVariation: opt.value };
-                onUpdateSettings(updated);
-                saveSettings(updated);
+                onUpdateSettings({ ...settings, frameVariation: opt.value });
               }}
               className={`flex-1 py-2 rounded-xl text-xs border transition-colors font-medium ${
                 settings.frameVariation === opt.value
@@ -177,9 +184,7 @@ export function PromptForm({ settings, onGenerate, onUpdateSettings, isGeneratin
               key={opt.value}
               type="button"
               onClick={() => {
-                const updated = { ...settings, imageSize: opt.value };
-                onUpdateSettings(updated);
-                saveSettings(updated);
+                onUpdateSettings({ ...settings, imageSize: opt.value });
               }}
               className={`py-2 px-2.5 rounded-xl text-xs border transition-colors font-medium ${
                 settings.imageSize === opt.value

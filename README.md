@@ -16,7 +16,7 @@ npm run dev
 
 ## ✨ 新增功能（v2.0）
 
-- **📖 故事展开**：输入简短梗概，ChatGPT 5.4 自动展开为完整剧情
+- **📖 故事展开**：输入简短梗概，ChatGPT 5.5 自动展开为完整剧情
 - **🎬 视频合成**：所有帧图片生成后，一键合成 MP4 视频
 - **🔄 三步流程**：梗概 → 展开故事 → 分镜生图 → 合成视频
 
@@ -25,9 +25,9 @@ npm run dev
 ```
 用户输入故事梗概（1-2句话）
        ↓
-ChatGPT 5.4 展开为完整剧情（800-1200字）
+ChatGPT 5.5 展开为完整剧情（800-1200字）
        ↓
-ChatGPT 5.4 将剧情拆分为 N 个分镜脚本（含人物一致性描述）
+ChatGPT 5.5 将剧情拆分为 N 个分镜脚本（含人物一致性描述）
        ↓
 GPT Image 2 并发生成每一帧图像（3并发）
        ↓
@@ -46,7 +46,7 @@ ffmpeg 将帧序列合成为 MP4 视频（8fps）
 IMAGE_API_BASE=https://wzjself.org/v1
 IMAGE_API_KEY=your_image_api_key_here
 
-# 文本生成 API（OpenAI / ChatGPT 5.4）
+# 文本生成 API（OpenAI / ChatGPT 5.5）
 OPENAI_API_BASE=https://api.openai.com/v1
 OPENAI_API_KEY=your_openai_api_key_here
 ```
@@ -57,7 +57,7 @@ OPENAI_API_KEY=your_openai_api_key_here
 - Vite 7 构建工具
 - Tailwind CSS + shadcn/ui
 - Express 5 后端代理
- - ChatGPT 5.4（故事展开 + 分镜脚本）
+ - ChatGPT 5.5（故事展开 + 分镜脚本）
 - GPT Image 2（帧图像生成）
 - ffmpeg（视频合成）
 

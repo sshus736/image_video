@@ -130,7 +130,7 @@ IMPORTANT:
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'gpt-5.4',
+      model: 'gpt-5.5',
       messages: [
         { role: 'system', content: 'You are a meticulous film director. Respond with valid JSON only. Be extremely detailed and specific.' },
         { role: 'user', content: prompt },
@@ -206,7 +206,7 @@ async function generateSegmentFrames(
   isFirstSegment: boolean = false,
   variation: number = 0.10,   // 帧间变化幅度（0.01-0.30）
 ): Promise<Shot[]> {
-  const lockedVariation = Math.min(Math.max(variation, 0.03), 0.06);
+  const lockedVariation = Math.min(Math.max(variation, 0.03), 0.30);
   // 构建场景模板文本（每帧复制的部分）
   const charBlock = template.characters.length > 0
     ? template.characters.map(c => `${c.name}: ${c.appearance} (position: ${c.position})`).join('. ')
@@ -233,31 +233,35 @@ async function generateSegmentFrames(
         ? `MODERATE: change ${maxChangedWords} words between frames. Think smooth character animation.`
         : `EXPRESSIVE: change ${maxChangedWords} words between frames. Think dynamic character animation.`;
 
-  const prompt = `You are creating a sequence of frame images for a REFERENCE-BASED animation pipeline.
+  const prompt = `You are creating a sequence of frame images for a unified-background inpainting animation pipeline.
 
 ## HOW THE PIPELINE WORKS:
-- Frame 1 of this segment will be generated as a standalone "master frame" (full scene prompt, no reference image)
-- Frames 2-${frameCount} will use Frame 1 as a VISUAL REFERENCE (image-to-image mode)
-- The reference image LOCKS the character appearance, background, lighting, composition, color palette
-- The prompt for frames 2+ should describe ONLY the action/pose/expression DELTA from the reference
-- This ensures every frame looks like the SAME scene with the SAME character, only action changes
+- Frame 1 is generated on a fixed unified background and becomes the master frame.
+- Frames 2+ are image-to-image from the immediately previous frame, so each prompt must describe only the next tiny motion step.
+- A separate character turnaround sheet is used ONLY to lock identity, outfit, body proportions, and colors for the master frame.
+- The camera, lens, crop, background objects, lighting, color palette, and character scale must stay locked across all frames.
+- Every frame prompt MUST explicitly describe where the character stands/sits in the frame, body orientation, gaze direction, pose, and the tiny change from the previous frame.
+- Never let the character turnaround sheet force a front-facing neutral pose.
 
-## SCENE TEMPLATE (use FULL template only for Frame 1's imagePrompt):
+## SCENE TEMPLATE:
 ${sceneBlock}
 
 ## SEGMENT STORY: ${segment.description}
 
 ## FRAME IMAGE RULES:
 1. Generate EXACTLY ${frameCount} frames (numbered 1 to ${frameCount})
-2. Frame 1 imagePrompt = FULL scene template + initial action description (60-100 words, complete standalone prompt)
-3. Frames 2+ imagePrompt = SHORT action delta only (15-35 words), describing ONLY what movement/expression changes from the reference. Do NOT repeat scene template - the reference image already provides it.
-4. Frames 2+ actionDescription = same short delta as imagePrompt (15-35 words)
+2. Every imagePrompt must be a complete frame instruction, 55-95 English words, including locked scene/camera plus the current pose.
+3. Every actionDescription must be a frame-to-frame motion delta, not a new scene. Include screen position, body orientation, gaze direction, pose/action, expression, and exactly what changed since the previous frame. 30-55 English words.
+4. If the story implies side/back/profile/looking-away, state it explicitly. Avoid defaulting to "front-facing".
 5. ${variationDesc}
-6. The action change must be GRADUAL and CONTINUOUS across frames
-7. DO NOT change: background, lighting, composition, color palette, clothing, camera angle, character appearance
+6. The action change must be GRADUAL and CONTINUOUS across frames, suitable for animation onion-skinning.
+7. DO NOT change: background, camera angle, crop, lens, lighting, color palette, clothing, character identity, character scale, or prop positions.
 8. DO NOT add/remove characters or objects between frames
 9. The first frame${isFirstSegment ? '' : ' must smoothly continue from the previous segment\'s last action'}: ${prevFrameAction || 'starting pose based on story'}
-10. CRITICAL: Every frame MUST look like the SAME still photograph. Same character, same scene. Only tiny pose/expression shifts.
+10. CRITICAL: The character turnaround reference is IDENTITY ONLY. Do not copy its neutral front-facing pose into story frames.
+11. CRITICAL: Frame-specific placement/orientation/action has higher priority than the turnaround sheet.
+12. For frames 2+, actionDescription should start with "From the previous frame," and describe a small incremental movement such as head turn, eye line shift, hand lift, weight shift, step, or expression change.
+13. Keep motion physically plausible: no teleporting, no sudden scale changes, no sudden limb jumps, no new camera move.
 
 ## KEYFRAME PRINCIPLE:
 - Frame 1: starting action (subtle, establishing) — this is the MASTER FRAME used as visual reference
@@ -277,13 +281,13 @@ Return JSON:
       "mood": "中文情绪",
       "duration": "${(1/frameCount).toFixed(4)}s",
       "characterDescription": "英文人物外观（从模板复制）",
-      "imagePrompt": "Frame 1: FULL English prompt (60-100 words). Frames 2+: SHORT action delta (15-35 words, describe only what changes from reference).",
-      "actionDescription": "Same as imagePrompt for frames 2+ (15-35 word action delta). For Frame 1: leave empty."
+      "imagePrompt": "Complete English frame instruction. Must include exact screen position, body orientation, gaze direction, pose/action, expression, and scene interaction.",
+      "actionDescription": "English action instruction with screen position + body orientation + gaze direction + pose/action + expression."
     }
   ]
 }
 
-Generate exactly ${frameCount} shots. CRITICAL DISTINCTION: Frame 1 imagePrompt = full standalone scene prompt (60-100 words). Frame 2+ imagePrompt = short action delta only (15-35 words, no scene template repetition).`;
+Generate exactly ${frameCount} shots. Make the character's placement and facing direction follow the story, not the neutral turnaround sheet.`;
 
   // ── 带重试的段落帧生成 ──
   const MAX_RETRIES = 3;
@@ -295,7 +299,7 @@ Generate exactly ${frameCount} shots. CRITICAL DISTINCTION: Frame 1 imagePrompt 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'gpt-5.4',
+          model: 'gpt-5.5',
           messages: [
             { role: 'system', content: 'You are a frame image director for a reference-based animation pipeline. Frame 1 is the master frame (full scene prompt). Frames 2+ are reference-based (action delta only, since the reference image locks all visual elements). Respond with valid JSON only.' },
             { role: 'user', content: prompt },
@@ -649,6 +653,62 @@ export async function generateBackgroundImage(
   throw new Error('背景图 API 响应缺少 url 和 b64_json');
 }
 
+export async function generateCharacterTurnaround(
+  characterDescription: string,
+  style: string,
+  imageSize: string = '1024x1024',
+): Promise<{ imageUrl: string; prompt: string }> {
+  const fixedImageSize = normalizeImageSize(imageSize);
+  const prompt = `Create a clean character turnaround reference sheet for animation consistency.
+Show the SAME character in exactly three full-body views: front view, side view, and back view, aligned left to right on a plain neutral studio background.
+The character must be identical across all three views: same face, hair, body proportions, clothing, colors, accessories, and silhouette.
+No scene background, no action pose, no dramatic lighting, no extra props, no text labels, no watermark.
+Visual style: ${style}.
+Character specification: ${characterDescription}`;
+
+  console.log(`[generateCharacterTurnaround] prompt="${prompt.slice(0, 100)}...", size=${fixedImageSize}`);
+
+  const res = await fetch(`${API_BASE}/images`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-image-2',
+      prompt,
+      n: 1,
+      size: fixedImageSize,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: { message?: string } })?.error?.message || `人物三视图生成失败 (${res.status})`);
+  }
+
+  const data = await res.json();
+  const item = (data.data as Array<Record<string, unknown>>)?.[0];
+  if (!item) throw new Error('人物三视图 API 返回空数据');
+  if (item.b64_json) return { imageUrl: `data:image/png;base64,${item.b64_json}`, prompt };
+  if (item.url) {
+    try {
+      const proxyRes = await fetch(`${API_BASE}/fetch-image`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: item.url }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (proxyRes.ok) {
+        const proxyData = await proxyRes.json();
+        const base64 = (proxyData as { base64?: string })?.base64;
+        if (base64) return { imageUrl: base64, prompt };
+      }
+    } catch (proxyErr) {
+      console.warn(`[generateCharacterTurnaround] URL→base64 proxy failed: ${(proxyErr as Error).message}`);
+    }
+    return { imageUrl: item.url as string, prompt };
+  }
+  throw new Error('人物三视图 API 响应缺少 url 和 b64_json');
+}
+
 /**
  * 生成蒙版图（Canvas 绘制）
  * 根据 characterRegion 描述，在指定尺寸画布上绘制白色角色区域、黑色背景
@@ -756,6 +816,7 @@ async function inpaintFrame(
   frameName?: string,
   model = 'gpt-image-2',
   imageSize: string = '1024x1024',
+  characterReferenceImageUrl?: string,
 ): Promise<string> {
   const fixedImageSize = normalizeImageSize(imageSize);
   // 确保背景图是 base64 data URL
@@ -795,6 +856,7 @@ async function inpaintFrame(
         frameName,
         model,
         size: fixedImageSize,
+        characterReferenceImageBase64: characterReferenceImageUrl,
       }),
       signal: controller.signal,
     });
@@ -859,6 +921,8 @@ export async function generateShotImage(
   backgroundImageUrl?: string,
   maskDataUrl?: string,
   imageSize: string = '1024x1024',
+  requireBackgroundInpaint: boolean = false,
+  characterTurnaroundUrl?: string,
 ): Promise<string> {
   const fixedImageSize = normalizeImageSize(imageSize);
   let finalPrompt: string;
@@ -871,14 +935,18 @@ export async function generateShotImage(
     try {
       finalPrompt = await rewritePromptWithModification(shot.baseImagePrompt || shot.imagePrompt, modificationPrompt.trim());
       console.log(`[generateShotImage] Rewrote prompt via AI: "${modificationPrompt.trim().slice(0, 40)}..." → ${finalPrompt.length} chars`);
-    } catch (err) {
+    } catch {
       console.warn('[generateShotImage] AI prompt rewrite failed, using fallback');
       finalPrompt = `${shot.imagePrompt}. INSTRUCT: ${modificationPrompt.trim()}`;
     }
   } else if (isReferenceMode && shot.actionDescription?.trim()) {
     // 参考图模式 + 有动作描述：使用简短的动作 delta 作为 prompt
     // 参考图已锁定全部视觉要素，只需描述本帧的微小动作变化
-    finalPrompt = shot.actionDescription.trim();
+    finalPrompt = [
+      shot.actionDescription.trim(),
+      shot.sceneDescription ? `Scene continuity: ${shot.sceneDescription}` : '',
+      shot.cameraMovement ? `Camera must remain ${shot.cameraMovement}; do not introduce a new camera move.` : '',
+    ].filter(Boolean).join(' ');
     console.log(`[generateShotImage] Reference mode with actionDescription (${finalPrompt.length} chars delta)`);
   } else if (isReferenceMode) {
     // 参考图模式但无动作描述：使用完整 prompt（带一致性前缀）
@@ -903,8 +971,15 @@ export async function generateShotImage(
     console.log(`[generateShotImage] Using inpaint mode (background + mask), shot=${shot.id}`);
     try {
       // inpaint prompt = 角色外观 + 动作描述（不含背景信息，因为背景已固定）
-      const inpaintPrompt = finalPrompt;
-      const result = await inpaintFrame(backgroundImageUrl, maskDataUrl, inpaintPrompt, frameNameWithIndex, 'gpt-image-2', fixedImageSize);
+      const frameDirection = [
+        shot.actionDescription,
+        shot.sceneDescription,
+        shot.cameraMovement ? `camera: ${shot.cameraMovement}` : '',
+      ].filter(Boolean).join('. ');
+      const inpaintPrompt = characterTurnaroundUrl
+        ? `Frame-specific direction has highest priority: ${frameDirection}. Use the provided character turnaround image as an important visual reference for identity, face, hair, body proportions, clothing, colors, accessories, and silhouette. Do NOT copy the turnaround sheet's neutral front-facing standing pose. The turnaround is identity reference only, not a pose reference. Set the character's screen position, body orientation, gaze direction, pose, and expression exactly as required by this frame. Inpaint only inside the masked character area and preserve the existing background. Frame instruction: ${finalPrompt}`
+        : finalPrompt;
+      const result = await inpaintFrame(backgroundImageUrl, maskDataUrl, inpaintPrompt, frameNameWithIndex, 'gpt-image-2', fixedImageSize, characterTurnaroundUrl);
       console.log(`[generateShotImage] ✅ Inpaint succeeded, shot=${shot.id}`);
       return result;
     } catch (inpaintErr) {
@@ -916,9 +991,14 @@ export async function generateShotImage(
         return result;
       } catch (de2Err) {
         console.warn(`[generateShotImage] ⚠️ dall-e-2 inpaint also failed: ${(de2Err as Error).message}, falling back to direct generation`);
+        if (requireBackgroundInpaint) {
+          throw new Error(`统一背景人物生成失败：${(de2Err as Error).message}`);
+        }
         // 最终降级：直接生图
       }
     }
+  } else if (requireBackgroundInpaint) {
+    throw new Error('统一背景人物生成需要 backgroundImageUrl 和 maskDataUrl，且不能使用参考图模式或编辑模式。');
   } else {
     if (!backgroundImageUrl || !maskDataUrl) {
       console.log(`[generateShotImage] Direct generation mode (no background/mask), shot=${shot.id}`);
@@ -935,7 +1015,14 @@ export async function generateShotImage(
 
   // 参考图模式下，在 prompt 前添加一致性锚定指令
   const referencePrefix = isReferenceMode
-    ? 'REFERENCE-BASED GENERATION: Use the provided reference image as the visual base. Keep the EXACT same character appearance, face, clothing, background, lighting, composition, and color palette. Only adjust the character pose/action as described. '
+    ? [
+        'REFERENCE-BASED FRAME CONTINUATION:',
+        'Use the provided previous frame as the visual base for the next animation frame.',
+        'Preserve the same camera angle, lens, crop, perspective, background objects, object positions, lighting, shadows, color palette, image style, character identity, face, clothing, and character scale.',
+        'Make only the small character motion described in the prompt.',
+        'Do not repaint the scene, do not redesign the background, do not add or remove objects, do not zoom, do not pan, do not change the time of day.',
+        'The result should look like the next adjacent frame in the same shot.',
+      ].join(' ') + ' '
     : '';
 
   const body: Record<string, unknown> = {
@@ -1039,7 +1126,7 @@ async function rewritePromptWithModification(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'gpt-5.4',
+      model: 'gpt-5.5',
       messages: [
         {
           role: 'system',
@@ -1091,6 +1178,7 @@ export function saveProject(project: StoryboardProject): void {
       })),
       // 清除背景图 base64
       backgroundImageUrl: undefined,
+      characterTurnaroundUrl: undefined,
     };
 
     if (idx >= 0) existing[idx] = lightweight;

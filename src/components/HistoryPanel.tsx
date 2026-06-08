@@ -1,6 +1,5 @@
 import { Clock, Trash2, FolderOpen } from 'lucide-react';
 import type { StoryboardProject } from '../types/storyboard';
-import { deleteProject } from '../lib/openai';
 
 interface HistoryPanelProps {
   projects: StoryboardProject[];
@@ -41,10 +40,7 @@ export function HistoryPanel({ projects, onLoad, onDelete }: HistoryPanelProps) 
                 <FolderOpen size={13} />
               </button>
               <button
-                onClick={() => {
-                  deleteProject(p.id);
-                  onDelete(p.id);
-                }}
+                onClick={() => onDelete(p.id)}
                 className="p-1.5 rounded-lg bg-white/5 hover:bg-red-500/20 text-white/40 hover:text-red-400 transition-colors"
                 title="删除项目"
               >

@@ -43,12 +43,17 @@ export interface StoryboardProject {
   videoUrl?: string;          // 合成视频的 URL
   backgroundImageUrl?: string; // 固定背景图（背景分离方案）
   backgroundPrompt?: string;   // 背景图生成所用的 prompt
+  characterTurnaroundUrl?: string; // 人物三视图设定图
+  characterTurnaroundPrompt?: string; // 人物三视图生成 prompt
 }
 
 export type GenerationStep =
   | 'idle'
   | 'expanding-story'
   | 'generating-script'
+  | 'background-ready'
+  | 'generating-character'
+  | 'character-ready'
   | 'generating-images'
   | 'composing-video'
   | 'done'
